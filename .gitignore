@@ -1,0 +1,4 @@
+.vscode
+_build
+a.out*
+node_modules
