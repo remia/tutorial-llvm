@@ -12,3 +12,8 @@ opam install merlin ocp-indent
 opam install ocamlbuild camlp5 llvm
 
 ocamlbuild -pkgs llvm,llvm.analysis toy.byte
+
+Chapter 4
+---------
+
+opam install ctypes-foreign
