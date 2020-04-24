@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
@@ -6,11 +7,18 @@
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/TargetSelect.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar.h>
+#include <llvm/Transforms/Scalar/GVN.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +28,7 @@
 #include <vector>
 
 using namespace llvm;
+using namespace llvm::orc;
 
 
 //
@@ -247,7 +256,7 @@ std::unique_ptr<ExprAST> parse_expression();
 std::unique_ptr<ExprAST> parse_number_expr() {
     auto result = std::make_unique<NumberExprAST>(g_num_val);
     get_next_token(); // consume the number
-    return std::move(result); // TODO: remove the move ?
+    return result;
 }
 
 // parenthesexpr ::= '(' expression ')'
@@ -444,10 +453,28 @@ std::unique_ptr<PrototypeAST> parse_extern() {
 static LLVMContext g_context;
 static IRBuilder<> g_builder(g_context);
 static std::unique_ptr<Module> g_module;
+static std::unique_ptr<legacy::FunctionPassManager> g_fpm;
+static std::unique_ptr<KaleidoscopeJIT> g_jit;
+
 static std::map<std::string, Value*> g_named_values;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> g_function_prototypes;
+
 
 Value* log_error_v(const char* str) {
     log_error(str);
+    return nullptr;
+}
+
+Function* get_function(const std::string& name) {
+    // function is already available in the current module
+    if (auto func = g_module->getFunction(name))
+        return func;
+
+    // try to codegen the declaration from some existing prototype
+    auto it = g_function_prototypes.find(name);
+    if (it != g_function_prototypes.end())
+        return it->second->codegen();
+
     return nullptr;
 }
 
@@ -486,7 +513,7 @@ Value* BinaryExprAST::codegen() {
 
 Value* CallExprAST::codegen() {
     // look-up name in the global module table
-    Function* callee_f = g_module->getFunction(_callee);
+    Function* callee_f = get_function(_callee);
     if (!callee_f)
         return log_error_v("Unknown function referenced");
 
@@ -520,11 +547,10 @@ Function* PrototypeAST::codegen() {
 }
 
 Function* FunctionAST::codegen() {
-    // check for existing function from a previous `extern` declaration
-    Function *function = g_module->getFunction(_prototype->getName());
-
-    if (!function)
-        function = _prototype->codegen();
+    // transfer ownership of prototype to the global map
+    auto name = _prototype->getName();
+    g_function_prototypes[name] = std::move(_prototype);
+    Function *function = get_function(name);
 
     if (!function)
         return nullptr;
@@ -540,7 +566,13 @@ Function* FunctionAST::codegen() {
 
     if (Value* retval = _body->codegen()) {
         g_builder.CreateRet(retval);
+
+        // consistency checks
         verifyFunction(*function);
+
+        // optimizer
+        g_fpm->run(*function);
+
         return function;
     }
 
@@ -551,8 +583,28 @@ Function* FunctionAST::codegen() {
 
 
 //
-// Top level parser
+// Top level parser and JIT driver
 //
+
+void initialize_module_and_passmanager() {
+    // open a new module
+    g_module = std::make_unique<Module>("my cool jit", g_context);
+    g_module->setDataLayout(g_jit->getTargetMachine().createDataLayout());
+
+    // attach a pass manager
+    g_fpm = std::make_unique<legacy::FunctionPassManager>(g_module.get());
+
+    // simple peephole optimizations and bit-twiddling
+    g_fpm->add(createInstructionCombiningPass());
+    // reassociate expressions
+    g_fpm->add(createReassociatePass());
+    // eliminate common subexpressions
+    g_fpm->add(createGVNPass());
+    // simplify control flow graph (eg. deleting unreachable blocks)
+    g_fpm->add(createCFGSimplificationPass());
+
+    g_fpm->doInitialization();
+}
 
 void handle_definition() {
     if (auto ast = parse_definition()) {
@@ -560,6 +612,8 @@ void handle_definition() {
             fprintf(stderr, "Parsed a function definition\n");
             ir->print(errs());
             fprintf(stderr, "\n");
+            g_jit->addModule(std::move(g_module));
+            initialize_module_and_passmanager();
         }
     }
     else
@@ -573,6 +627,7 @@ void handle_extern() {
             fprintf(stderr, "Parsed an extern\n");
             ir->print(errs());
             fprintf(stderr, "\n");
+            g_function_prototypes[ast->getName()] = std::move(ast);
         }
     }
     else
@@ -583,9 +638,26 @@ void handle_extern() {
 void handle_toplevel_expression() {
     if (auto ast = parse_toplevelexpr()) {
         if (auto ir = ast->codegen()) {
+
             fprintf(stderr, "Parsed a top-level expression\n");
             ir->print(errs());
             fprintf(stderr, "\n");
+
+            // add current module to JIT
+            auto module = g_jit->addModule(std::move(g_module));
+            initialize_module_and_passmanager();
+
+            // search for the anonymous function symbol
+            auto expr_symbol = g_jit->findSymbol("__anon_expr");
+            assert(expr_symbol && "Function not found");
+
+            // get symbol address and cast to the anonymous function type
+            typedef double (*FuncT)();
+            FuncT func = (FuncT) (intptr_t) cantFail(expr_symbol.getAddress());
+            fprintf(stderr, "Evaluated to %f\n", func());
+
+            // delete module from JIT
+            g_jit->removeModule(module);
         }
     }
     else
@@ -620,10 +692,29 @@ void main_loop() {
 
 
 //
+// Library functions
+//
+
+extern "C" double putchard(double x) {
+    fputc((char) x, stderr);
+    return 0.0;
+}
+
+extern "C" double printd(double x) {
+    fprintf(stderr, "%f\n", x);
+    return 0;
+}
+
+
+//
 // Driver code
 //
 
 int main() {
+    InitializeNativeTarget();
+    InitializeNativeTargetAsmPrinter();
+    InitializeNativeTargetAsmParser();
+
     // 1 is the lowest precedence
     g_binop_precedence['<'] = 10;
     g_binop_precedence['+'] = 20;
@@ -633,11 +724,10 @@ int main() {
     fprintf(stderr, "ready> ");
     get_next_token();
 
-    g_module = std::make_unique<Module>("my cool jit", g_context);
+    g_jit = std::make_unique<KaleidoscopeJIT>();
+    initialize_module_and_passmanager();
 
     main_loop();
-
-    g_module->print(errs(), nullptr);
 
     return 0;
 }
