@@ -957,14 +957,13 @@ void handle_toplevel_expression() {
 //  ::= definition | external | expression | ';'
 void main_loop() {
     while (true) {
-        fprintf(stderr, "ready> ");
         switch (g_cur_tok) {
             case tok_eof:
                 return;
             // ignore top-level semicolons
             case ';':
                 get_next_token();
-                break;
+                continue;
             case tok_def:
                 handle_definition();
                 break;
@@ -975,6 +974,7 @@ void main_loop() {
                 handle_toplevel_expression();
                 break;
         }
+        fprintf(stderr, "ready> ");
     }
 }
 
