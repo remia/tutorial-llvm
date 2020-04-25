@@ -6,6 +6,7 @@
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
@@ -46,7 +47,14 @@ enum Token {
 
     // primary
     tok_identifier = -4,
-    tok_number = -5
+    tok_number = -5,
+
+    // control
+    tok_if = -6,
+    tok_then = -7,
+    tok_else = -8,
+    tok_for = -9,
+    tok_in = -10
 };
 
 // Global variables
@@ -58,7 +66,7 @@ static int gettok() {
     static int last_char = ' ';
 
     // skip any whitespaces
-    while (isspace(last_char))
+    while (isspace(last_char) || last_char == '\n')
         last_char = getchar();
 
     // identifier: [a-zA-Z][a-zA-Z0-9]*
@@ -71,6 +79,16 @@ static int gettok() {
             return tok_def;
         if (g_identifier_str == "extern")
             return tok_extern;
+        if (g_identifier_str == "if")
+            return tok_if;
+        if (g_identifier_str == "then")
+            return tok_then;
+        if (g_identifier_str == "else")
+            return tok_else;
+        if (g_identifier_str == "for")
+            return tok_for;
+        if (g_identifier_str == "in")
+            return tok_in;
 
         return tok_identifier;
     }
@@ -172,6 +190,45 @@ public:
 private:
     std::string _callee;
     std::vector<std::unique_ptr<ExprAST>> _args;
+};
+
+// Expression class for if / then / else
+class IfExprAST : public ExprAST {
+public:
+    IfExprAST(
+        std::unique_ptr<ExprAST> cond,
+        std::unique_ptr<ExprAST> then,
+        std::unique_ptr<ExprAST> else_expr
+    )
+    : _cond(std::move(cond))
+    , _then(std::move(then))
+    , _else(std::move(else_expr))
+    {}
+    Value* codegen() override;
+private:
+    std::unique_ptr<ExprAST> _cond, _then, _else;
+};
+
+// Expression class for for / in
+class ForExprAST : public ExprAST {
+public:
+    ForExprAST(
+        const std::string& var_name,
+        std::unique_ptr<ExprAST> start,
+        std::unique_ptr<ExprAST> end,
+        std::unique_ptr<ExprAST> step,
+        std::unique_ptr<ExprAST> body
+    )
+    : _var_name(var_name)
+    , _start(std::move(start))
+    , _end(std::move(end))
+    , _step(std::move(step))
+    , _body(std::move(body))
+    {}
+    Value* codegen() override;
+private:
+    std::string _var_name;
+    std::unique_ptr<ExprAST> _start, _end, _step, _body;
 };
 
 // Represents the "prototype" for a function, which captures its name,
@@ -311,6 +368,90 @@ std::unique_ptr<ExprAST> parse_identifierexpr() {
     return std::make_unique<CallExprAST>(id_name, std::move(args));
 }
 
+// ifexpr
+//  ::= 'if' expression 'then' expression 'else' expression
+std::unique_ptr<ExprAST> parse_ifexpr() {
+    get_next_token(); // consume 'if'
+
+    auto condition_expr = parse_expression();
+    if (!condition_expr)
+        return nullptr;
+
+    if (g_cur_tok != tok_then)
+        return log_error("Expected 'then'");
+    get_next_token(); // consume 'then'
+
+    auto then_expr = parse_expression();
+    if (!then_expr)
+        return nullptr;
+
+    if (g_cur_tok != tok_else)
+        return log_error("Expected 'else'");
+    get_next_token(); // consume 'else'
+
+    auto else_expr = parse_expression();
+    if (!else_expr)
+        return nullptr;
+
+    return std::make_unique<IfExprAST>(
+        std::move(condition_expr),
+        std::move(then_expr),
+        std::move(else_expr)
+    );
+}
+
+std::unique_ptr<ExprAST> parse_forexpr() {
+    get_next_token(); // consume 'for'
+
+    if (g_cur_tok != tok_identifier)
+        return log_error("Expected identifier after 'for'");
+
+    std::string var_name = g_identifier_str;
+    get_next_token(); // consume identifier
+
+    if (g_cur_tok != '=')
+        return log_error("Expected '=' after 'for'");
+    get_next_token(); // consume '='
+
+    auto start_expr = parse_expression();
+    if (!start_expr)
+        return nullptr;
+
+    if (g_cur_tok != ',')
+        return log_error("Expected ',' after 'for' start value");
+    get_next_token(); // consume ','
+
+    auto end_expr = parse_expression();
+    if (!end_expr)
+        return nullptr;
+
+    // step is optional
+    std::unique_ptr<ExprAST> step_expr;
+    if (g_cur_tok == ',') {
+        get_next_token(); // consume ','
+
+        step_expr = parse_expression();
+        if (!step_expr)
+            return nullptr;
+    }
+
+    if (g_cur_tok != tok_in)
+        return log_error("Expected 'in' after 'for'");
+    get_next_token(); // consume 'in'
+
+    auto body_expr = parse_expression();
+    if (!body_expr)
+        return nullptr;
+
+    return std::make_unique<ForExprAST>(
+        var_name,
+        std::move(start_expr),
+        std::move(end_expr),
+        std::move(step_expr),
+        std::move(body_expr)
+    );
+}
+
 // primary
 //  ::= identifierexpr
 //  ::= numberexpr
@@ -323,6 +464,10 @@ std::unique_ptr<ExprAST> parse_primary() {
             return parse_number_expr();
         case '(':
             return parse_parenthesexpr();
+        case tok_if:
+            return parse_ifexpr();
+        case tok_for:
+            return parse_forexpr();
         default:
             return log_error("Unknown token when expecting expression");
     }
@@ -529,6 +674,149 @@ Value* CallExprAST::codegen() {
     }
 
     return g_builder.CreateCall(callee_f, args_v, "calltmp");
+}
+
+Value* IfExprAST::codegen() {
+    Value* condition_value = _cond->codegen();
+    if (!condition_value)
+        return nullptr;
+
+    // convert to boolean
+    condition_value = g_builder.CreateFCmpONE(
+        condition_value, ConstantFP::get(g_context, APFloat(0.0)), "ifcond");
+
+    Function* function = g_builder.GetInsertBlock()->getParent();
+
+    // control flow blocks, 'then' block is inserted at the end of
+    // the current function
+    BasicBlock* then_block = BasicBlock::Create(g_context, "then", function);
+    BasicBlock* else_block = BasicBlock::Create(g_context, "else");
+    BasicBlock* merge_block = BasicBlock::Create(g_context, "ifcont");
+
+    g_builder.CreateCondBr(condition_value, then_block, else_block);
+
+    // emit then block
+    g_builder.SetInsertPoint(then_block);
+
+    Value* then_value = _then->codegen();
+    if (!then_value)
+        return nullptr;
+
+    g_builder.CreateBr(merge_block);
+    // codegen for 'then' can change the current block, keep this
+    // updated block for the phi node
+    then_block = g_builder.GetInsertBlock();
+
+    // emit else block
+    function->getBasicBlockList().push_back(else_block);
+    g_builder.SetInsertPoint(else_block);
+
+    Value* else_value = _else->codegen();
+    if (!else_value)
+        return nullptr;
+
+    g_builder.CreateBr(merge_block);
+    // codegen for 'else' can change the current block, keep this
+    // updated block for the phi node
+    else_block = g_builder.GetInsertBlock();
+
+    // emit merge block
+    function->getBasicBlockList().push_back(merge_block);
+    g_builder.SetInsertPoint(merge_block);
+
+    // phi node for the return value
+    PHINode* phi_node = g_builder.CreatePHI(Type::getDoubleTy(g_context), 2, "iftmp");
+    phi_node->addIncoming(then_value, then_block);
+    phi_node->addIncoming(else_value, else_block);
+    return phi_node;
+}
+
+// output for loop as:
+//   ...
+//   start = startexpr
+//   goto loop
+// loop:
+//   variable = phi [start, loopheader], [nextvariable, loopend]
+//   ...
+//   bodyexpr
+//   ...
+// loopend:
+//   step = stepexpr
+//   nextvariable = variable + step
+//   endcond = endexpr
+//   br endcond, loop, endloop
+// outloop:
+//   0
+Value* ForExprAST::codegen() {
+    // emit start
+    Value* start_value = _start->codegen();
+    if (!start_value)
+        return nullptr;
+
+    Function* function = g_builder.GetInsertBlock()->getParent();
+
+    // control flow blocks, 'loop' block is inserted at the end of
+    // the current function
+    BasicBlock* header_block = g_builder.GetInsertBlock();
+    BasicBlock* loop_block = BasicBlock::Create(g_context, "loop", function);
+
+    g_builder.CreateBr(loop_block);
+    g_builder.SetInsertPoint(loop_block);
+
+    // phi node for loop variable
+    PHINode* phi_node = g_builder.CreatePHI(Type::getDoubleTy(g_context), 2, _var_name);
+    phi_node->addIncoming(start_value, header_block);
+
+    // loop variable is defined as the phi node, handle possible
+    // shadowing of existing variable
+    Value* old_value = g_named_values[_var_name];
+    g_named_values[_var_name] = phi_node;
+
+    // emit loop body, ignoring the return value
+    if (!_body->codegen())
+        return nullptr;
+
+    // emit step
+    Value* step_value = nullptr;
+    if (_step) {
+        step_value = _step->codegen();
+        if (!step_value)
+            return nullptr;
+    }
+    else {
+        step_value = ConstantFP::get(g_context, APFloat(1.0));
+    }
+
+    Value* next_value = g_builder.CreateFAdd(phi_node, step_value, "nextvar");
+
+    // emit end
+    Value* end_condition = _end->codegen();
+    if (!end_condition)
+        return nullptr;
+
+    // convert to boolean
+    end_condition = g_builder.CreateFCmpONE(
+        end_condition, ConstantFP::get(g_context, APFloat(0.0)), "loopcond");
+
+    // codegen for 'loop' can change the current block
+    BasicBlock* loop_end_block = g_builder.GetInsertBlock();
+    BasicBlock* after_block = BasicBlock::Create(g_context, "afterloop", function);
+
+    g_builder.CreateCondBr(end_condition, loop_block, after_block);
+    g_builder.SetInsertPoint(after_block);
+
+    // we only know now what is the loop real end block,
+    // because of the possibility to have nested control flow structures
+    phi_node->addIncoming(next_value, loop_end_block);
+
+    // unshadow loop variable
+    if (old_value)
+        g_named_values[_var_name] = old_value;
+    else
+        g_named_values.erase(_var_name);
+
+    // for expr always returns 0.0
+    return Constant::getNullValue(Type::getDoubleTy(g_context));
 }
 
 Function* PrototypeAST::codegen() {
