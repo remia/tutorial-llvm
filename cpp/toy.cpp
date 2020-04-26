@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -54,7 +55,11 @@ enum Token {
     tok_then = -7,
     tok_else = -8,
     tok_for = -9,
-    tok_in = -10
+    tok_in = -10,
+
+    // operators
+    tok_binary = -11,
+    tok_unary = -12
 };
 
 // Global variables
@@ -89,6 +94,10 @@ static int gettok() {
             return tok_for;
         if (g_identifier_str == "in")
             return tok_in;
+        if (g_identifier_str == "binary")
+            return tok_binary;
+        if (g_identifier_str == "unary")
+            return tok_unary;
 
         return tok_identifier;
     }
@@ -156,6 +165,22 @@ public:
     Value* codegen() override;
 private:
     std::string _name;
+};
+
+// Expression class for unary operator
+class UnaryExprAST : public ExprAST {
+public:
+    UnaryExprAST(
+        char op,
+        std::unique_ptr<ExprAST> operand
+    )
+    : _op(op)
+    , _operand(std::move(operand))
+    {}
+    Value* codegen() override;
+private:
+    char _op;
+    std::unique_ptr<ExprAST> _operand;
 };
 
 // Expression class for binary operator
@@ -238,17 +263,32 @@ class PrototypeAST {
 public:
     PrototypeAST(
         const std::string& name,
-        std::vector<std::string> args
+        std::vector<std::string> args,
+        bool is_operator = false,
+        unsigned precedence = 0
     )
     : _name(name)
     , _args(std::move(args))
+    , _is_operator(is_operator)
+    , _precedence(precedence)
     {}
     Function* codegen();
+
     const std::string& getName() const { return _name; }
+    char getOperatorName() const {
+        assert(isUnaryOp() || isBinaryOp());
+        return _name[_name.size() - 1];
+    }
+    unsigned getBinaryPrecedence() const { return _precedence; }
+
+    bool isUnaryOp() const { return _is_operator && _args.size() == 1; }
+    bool isBinaryOp() const { return _is_operator && _args.size() == 2; }
 
 private:
     std::string _name;
     std::vector<std::string> _args;
+    bool _is_operator;
+    unsigned _precedence;
 };
 
 // Represents a function definition itself
@@ -456,6 +496,8 @@ std::unique_ptr<ExprAST> parse_forexpr() {
 //  ::= identifierexpr
 //  ::= numberexpr
 //  ::= parenexpr
+//  ::= ifexpr
+//  ::= forexpr
 std::unique_ptr<ExprAST> parse_primary() {
     switch (g_cur_tok) {
         case tok_identifier:
@@ -471,6 +513,23 @@ std::unique_ptr<ExprAST> parse_primary() {
         default:
             return log_error("Unknown token when expecting expression");
     }
+}
+
+// unary
+//  ::= primary
+//  ::= '!' unary
+std::unique_ptr<ExprAST> parse_unary() {
+    // current token is not an operator, parse the primary expr
+    if (!isascii(g_cur_tok) || g_cur_tok == '(' || g_cur_tok == ',')
+        return parse_primary();
+
+    int op = g_cur_tok;
+    get_next_token(); // consume op
+
+    // recursive call handle unary op chaining (eg. !!var)
+    if (auto operand = parse_unary())
+        return std::make_unique<UnaryExprAST>(op, std::move(operand));
+    return nullptr;
 }
 
 // binop rhs
@@ -489,8 +548,8 @@ std::unique_ptr<ExprAST> parse_binoprhs(
         int binop = g_cur_tok;
         get_next_token(); // consume binop
 
-        // parse the primary expression after the binop
-        auto rhs = parse_primary();
+        // parse the unary expression after the binop
+        auto rhs = parse_unary();
         if (!rhs)
             return nullptr;
 
@@ -515,7 +574,7 @@ std::unique_ptr<ExprAST> parse_binoprhs(
 // expression
 //  ::= primary binoprhs
 std::unique_ptr<ExprAST> parse_expression() {
-    auto lhs = parse_primary();
+    auto lhs = parse_unary();
     if (!lhs)
         return nullptr;
 
@@ -524,27 +583,72 @@ std::unique_ptr<ExprAST> parse_expression() {
 
 // prototype
 //  ::= id '(' id* ')'
+//  ::= binary LETTER number? (id, id)
+//  ::= unary LETTER (id)
 std::unique_ptr<PrototypeAST> parse_prototype() {
-    if (g_cur_tok != tok_identifier)
-        return log_error_prototype("Expected function mae in prototype");
+    std::string func_name;
 
-    std::string func_name = g_identifier_str;
-    get_next_token();
+    // 0 = identifier, 1 = unary, 2 = binary
+    unsigned kind = 0;
+    unsigned binary_precedence = 0;
 
+    switch (g_cur_tok) {
+        case tok_identifier:
+            func_name = g_identifier_str;
+            kind = 0;
+            get_next_token(); // consume func_name
+            break;
+        case tok_unary:
+            get_next_token(); // consume 'unary'
+            if (!isascii(g_cur_tok))
+                return log_error_prototype("Expected unary operator");
+            func_name = "unary";
+            func_name += (char) g_cur_tok;
+            kind = 1;
+            get_next_token(); // consume op
+            break;
+        case tok_binary:
+            get_next_token(); // consume 'binary'
+            if (!isascii(g_cur_tok))
+                return log_error_prototype("Expected binary operator");
+            func_name = "binary";
+            func_name += (char) g_cur_tok;
+            kind = 2;
+            get_next_token(); // consume op
+
+            // parse optional precedence
+            if (g_cur_tok == tok_number) {
+                if (g_num_val < 1 || g_num_val > 100)
+                    return log_error_prototype("Invalid precedence: must be 1..100");
+                binary_precedence = (unsigned) g_num_val;
+                get_next_token(); // consume precedence
+            }
+            break;
+        default:
+            return log_error_prototype("Expected function name in prototype");
+    }
+
+    // parse arguments
     if (g_cur_tok != '(')
         return log_error_prototype("Expected '(' in prototype");
 
     std::vector<std::string> arg_names;
     while (get_next_token() == tok_identifier)
         arg_names.push_back(g_identifier_str);
-
     if (g_cur_tok != ')')
         return log_error_prototype("Expected ')' in prototype");
 
     get_next_token(); // consume ')'
 
+    // operator arguments count checking
+    if (kind && arg_names.size() != kind)
+        return log_error_prototype("Invalid number of operands for operator");
+
     return std::make_unique<PrototypeAST>(
-        func_name, std::move(arg_names)
+        func_name,
+        arg_names,
+        kind != 0,
+        binary_precedence
     );
 }
 
@@ -605,7 +709,7 @@ static std::map<std::string, Value*> g_named_values;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> g_function_prototypes;
 
 
-Value* log_error_v(const char* str) {
+Value* log_error_value(const char* str) {
     log_error(str);
     return nullptr;
 }
@@ -630,8 +734,20 @@ Value* NumberExprAST::codegen() {
 Value* VariableExprAST::codegen() {
     Value* val = g_named_values[_name];
     if (!val)
-        return log_error_v("Unknown variable name");
+        return log_error_value("Unknown variable name");
     return val;
+}
+
+Value* UnaryExprAST::codegen() {
+    Value* operand_value = _operand->codegen();
+    if (!operand_value)
+        return nullptr;
+
+    Function* func = get_function(std::string("unary") + _op);
+    if (!func)
+        return log_error_value("Unknown unary operator");
+
+    return g_builder.CreateCall(func, operand_value, "unop");
 }
 
 Value* BinaryExprAST::codegen() {
@@ -652,19 +768,27 @@ Value* BinaryExprAST::codegen() {
             // convert bool 0 / 1 to double 0.0 / 1.0
             return g_builder.CreateUIToFP(lhs, Type::getDoubleTy(g_context), "booltmp");
         default:
-            return log_error_v("Invalid Binary operator");
+            break;
     }
+
+    // user defined operator
+    Function* func = get_function(std::string("binary") + _op);
+    if (!func)
+        return log_error_value("Unknown binary operator");
+
+    Value* args[] = {lhs, rhs};
+    return g_builder.CreateCall(func, args, "binop");
 }
 
 Value* CallExprAST::codegen() {
     // look-up name in the global module table
     Function* callee_f = get_function(_callee);
     if (!callee_f)
-        return log_error_v("Unknown function referenced");
+        return log_error_value("Unknown function referenced");
 
     // argument mismatch error
     if (callee_f->arg_size() != _args.size())
-        return log_error_v("Incorrect # arguments passed");
+        return log_error_value("Incorrect # arguments passed");
 
     std::vector<Value*> args_v;
     for (unsigned i = 0, e = _args.size(); i != e; ++i) {
@@ -838,10 +962,14 @@ Function* FunctionAST::codegen() {
     // transfer ownership of prototype to the global map
     auto name = _prototype->getName();
     g_function_prototypes[name] = std::move(_prototype);
-    Function *function = get_function(name);
+    auto& prototype = g_function_prototypes[name];
 
+    Function *function = get_function(prototype->getName());
     if (!function)
         return nullptr;
+
+    if (prototype->isBinaryOp())
+        g_binop_precedence[prototype->getOperatorName()] = prototype->getBinaryPrecedence();
 
     // create a new basic block to start insertion into
     BasicBlock *bb = BasicBlock::Create(g_context, "entry", function);
@@ -866,6 +994,9 @@ Function* FunctionAST::codegen() {
 
     // error generating the function body
     function->eraseFromParent();
+    if (prototype->isBinaryOp())
+        g_binop_precedence.erase(prototype->getOperatorName());
+
     return nullptr;
 }
 
