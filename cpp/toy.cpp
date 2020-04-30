@@ -17,6 +17,7 @@
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Utils.h>
 
 #include <algorithm>
 #include <cassert>
@@ -27,6 +28,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace llvm;
@@ -59,7 +61,10 @@ enum Token {
 
     // operators
     tok_binary = -11,
-    tok_unary = -12
+    tok_unary = -12,
+
+    // var definition
+    tok_var = -13
 };
 
 // Global variables
@@ -98,6 +103,8 @@ static int gettok() {
             return tok_binary;
         if (g_identifier_str == "unary")
             return tok_unary;
+        if (g_identifier_str == "var")
+            return tok_var;
 
         return tok_identifier;
     }
@@ -163,6 +170,7 @@ class VariableExprAST : public ExprAST {
 public:
     VariableExprAST(const std::string& name) : _name(name) {}
     Value* codegen() override;
+    const std::string& getName() const { return _name; }
 private:
     std::string _name;
 };
@@ -254,6 +262,22 @@ public:
 private:
     std::string _var_name;
     std::unique_ptr<ExprAST> _start, _end, _step, _body;
+};
+
+// Expression class for for / in
+class VarExprAST : public ExprAST {
+public:
+    VarExprAST(
+        std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> var_names,
+        std::unique_ptr<ExprAST> body
+    )
+    : _var_names(std::move(var_names))
+    , _body(std::move(body))
+    {}
+    Value* codegen() override;
+private:
+    std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> _var_names;
+    std::unique_ptr<ExprAST> _body;
 };
 
 // Represents the "prototype" for a function, which captures its name,
@@ -440,6 +464,8 @@ std::unique_ptr<ExprAST> parse_ifexpr() {
     );
 }
 
+// forexpr
+//  ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expression
 std::unique_ptr<ExprAST> parse_forexpr() {
     get_next_token(); // consume 'for'
 
@@ -492,12 +518,61 @@ std::unique_ptr<ExprAST> parse_forexpr() {
     );
 }
 
+// varexpr
+//  ::= 'var' identifier ('=' expression)?
+//             (',' identifier ('=' expression)?)* 'in' expression
+std::unique_ptr<ExprAST> parse_varexpr() {
+    get_next_token(); // consume 'var'
+
+    std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> var_names;
+
+    // at least one variable name is required
+    if (g_cur_tok != tok_identifier)
+        return log_error("Expected identifier after 'var'");
+
+    while (true) {
+        std::string name = g_identifier_str;
+        get_next_token(); // consume identifier
+
+        // optional initializer
+        std::unique_ptr<ExprAST> init = nullptr;
+        if (g_cur_tok == '=') {
+            get_next_token(); // consume '='
+            init = parse_expression();
+            if (!init)
+                return nullptr;
+        }
+
+        var_names.push_back(std::make_pair(name, std::move(init)));
+
+        // end of var list
+        if (g_cur_tok != ',')
+            break;
+        get_next_token(); // consume ','
+
+        if (g_cur_tok != tok_identifier)
+            return log_error("Expected identifier list after 'var'");
+    }
+
+    if (g_cur_tok != tok_in)
+        return log_error("Expected 'in' keyword after 'var'");
+    get_next_token(); // consume 'in'
+
+    auto body = parse_expression();
+    if (!body)
+        return nullptr;
+
+    return std::make_unique<VarExprAST>(std::move(var_names), std::move(body));
+}
+
+
 // primary
 //  ::= identifierexpr
 //  ::= numberexpr
 //  ::= parenexpr
 //  ::= ifexpr
 //  ::= forexpr
+//  ::= varexpr
 std::unique_ptr<ExprAST> parse_primary() {
     switch (g_cur_tok) {
         case tok_identifier:
@@ -510,6 +585,8 @@ std::unique_ptr<ExprAST> parse_primary() {
             return parse_ifexpr();
         case tok_for:
             return parse_forexpr();
+        case tok_var:
+            return parse_varexpr();
         default:
             return log_error("Unknown token when expecting expression");
     }
@@ -705,7 +782,7 @@ static std::unique_ptr<Module> g_module;
 static std::unique_ptr<legacy::FunctionPassManager> g_fpm;
 static std::unique_ptr<KaleidoscopeJIT> g_jit;
 
-static std::map<std::string, Value*> g_named_values;
+static std::map<std::string, AllocaInst*> g_named_values;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> g_function_prototypes;
 
 
@@ -727,6 +804,20 @@ Function* get_function(const std::string& name) {
     return nullptr;
 }
 
+// create an alloca instruction in the entry block of the function
+// this is used for mutable variables
+AllocaInst* create_entry_block_alloca(Function* function, StringRef var_name) {
+    IRBuilder<> tmp_block(
+        &function->getEntryBlock(),
+        function->getEntryBlock().begin()
+    );
+    return tmp_block.CreateAlloca(
+        Type::getDoubleTy(g_context),
+        nullptr,
+        var_name
+    );
+}
+
 Value* NumberExprAST::codegen() {
     return ConstantFP::get(g_context, APFloat(_val));
 }
@@ -735,7 +826,9 @@ Value* VariableExprAST::codegen() {
     Value* val = g_named_values[_name];
     if (!val)
         return log_error_value("Unknown variable name");
-    return val;
+
+    // load the value
+    return g_builder.CreateLoad(val, _name.c_str());
 }
 
 Value* UnaryExprAST::codegen() {
@@ -751,6 +844,31 @@ Value* UnaryExprAST::codegen() {
 }
 
 Value* BinaryExprAST::codegen() {
+    // for '=', we don't want to emit the LHS as an expression
+    if (_op == '=') {
+        // assignment require lhs to be an identifier
+        // this assume building without RTTI because LLVM builds that way
+        // by default, if building LLVM with RTTI, this can be changed to
+        // a dynamic_cast for automatic error checking
+        VariableExprAST* lhs = static_cast<VariableExprAST*>(_lhs.get());
+        if (!lhs)
+            return log_error_value("Destination of '=' must be a variable");
+
+        // codegen rhs
+        Value* rhs = _rhs->codegen();
+        if (!rhs)
+            return nullptr;
+
+        // look up variable name
+        Value* variable = g_named_values[lhs->getName()];
+        if (!variable)
+            return log_error_value("Unknown variable name");
+
+        g_builder.CreateStore(rhs, variable);
+        return rhs;
+    }
+
+
     Value* lhs = _lhs->codegen();
     Value* rhs = _rhs->codegen();
     if (!lhs or !rhs)
@@ -872,12 +990,18 @@ Value* IfExprAST::codegen() {
 // outloop:
 //   0
 Value* ForExprAST::codegen() {
-    // emit start
+    Function* function = g_builder.GetInsertBlock()->getParent();
+
+    // alloca for the loop variable in the entry block
+    AllocaInst* alloca = create_entry_block_alloca(function, _var_name);
+
+    // emit start codem without 'variable' in scope
     Value* start_value = _start->codegen();
     if (!start_value)
         return nullptr;
 
-    Function* function = g_builder.GetInsertBlock()->getParent();
+    // store loop variable
+    g_builder.CreateStore(start_value, alloca);
 
     // control flow blocks, 'loop' block is inserted at the end of
     // the current function
@@ -887,14 +1011,10 @@ Value* ForExprAST::codegen() {
     g_builder.CreateBr(loop_block);
     g_builder.SetInsertPoint(loop_block);
 
-    // phi node for loop variable
-    PHINode* phi_node = g_builder.CreatePHI(Type::getDoubleTy(g_context), 2, _var_name);
-    phi_node->addIncoming(start_value, header_block);
-
     // loop variable is defined as the phi node, handle possible
     // shadowing of existing variable
-    Value* old_value = g_named_values[_var_name];
-    g_named_values[_var_name] = phi_node;
+    AllocaInst* old_value = g_named_values[_var_name];
+    g_named_values[_var_name] = alloca;
 
     // emit loop body, ignoring the return value
     if (!_body->codegen())
@@ -910,28 +1030,24 @@ Value* ForExprAST::codegen() {
     else {
         step_value = ConstantFP::get(g_context, APFloat(1.0));
     }
-
-    Value* next_value = g_builder.CreateFAdd(phi_node, step_value, "nextvar");
-
     // emit end
     Value* end_condition = _end->codegen();
     if (!end_condition)
         return nullptr;
 
+    // reload, increment and restore the alloca
+    // this handle case where the loop body mutates the variable
+    Value* cur_value = g_builder.CreateLoad(alloca, _var_name.c_str());
+    Value* next_value = g_builder.CreateFAdd(cur_value, step_value, "nextvar");
+    g_builder.CreateStore(next_value, alloca);
+
     // convert to boolean
     end_condition = g_builder.CreateFCmpONE(
         end_condition, ConstantFP::get(g_context, APFloat(0.0)), "loopcond");
 
-    // codegen for 'loop' can change the current block
-    BasicBlock* loop_end_block = g_builder.GetInsertBlock();
     BasicBlock* after_block = BasicBlock::Create(g_context, "afterloop", function);
-
     g_builder.CreateCondBr(end_condition, loop_block, after_block);
     g_builder.SetInsertPoint(after_block);
-
-    // we only know now what is the loop real end block,
-    // because of the possibility to have nested control flow structures
-    phi_node->addIncoming(next_value, loop_end_block);
 
     // unshadow loop variable
     if (old_value)
@@ -941,6 +1057,52 @@ Value* ForExprAST::codegen() {
 
     // for expr always returns 0.0
     return Constant::getNullValue(Type::getDoubleTy(g_context));
+}
+
+Value* VarExprAST::codegen() {
+    std::vector<AllocaInst*> old_bindings;
+
+    Function* function = g_builder.GetInsertBlock()->getParent();
+
+    // register all variables and emit their initializer
+    for (unsigned i = 0, e = _var_names.size(); i != e; ++i) {
+        const std::string& var_name = _var_names[i].first;
+        ExprAST* init = _var_names[i].second.get();
+
+        // emit initializer before adding the variable to scope,
+        // this prevents the initializer fron referencing the variable
+        // itselfm and permits stuff like this:
+        //  var a = 1 in
+        //    var a = a in ... # refers to outer 'a'
+        Value* init_val;
+        if (init) {
+            init_val = init->codegen();
+            if (!init_val)
+                return nullptr;
+        }
+        // use 0.0 by default
+        else {
+            init_val = ConstantFP::get(g_context, APFloat(0.0));
+        }
+
+        AllocaInst* alloca = create_entry_block_alloca(function, var_name);
+        g_builder.CreateStore(init_val, alloca);
+
+        // remember the old variable binding
+        old_bindings.push_back(g_named_values[var_name]);
+        g_named_values[var_name] = alloca;
+    }
+
+    // now that all vars are in scope, codegen the body
+    Value* body_val = _body->codegen();
+    if (!body_val)
+        return nullptr;
+
+    // restore variables
+    for (unsigned i = 0, e = _var_names.size(); i != e; ++i)
+        g_named_values[_var_names[i].first] = old_bindings[i];
+
+    return body_val;
 }
 
 Function* PrototypeAST::codegen() {
@@ -977,8 +1139,11 @@ Function* FunctionAST::codegen() {
 
     // record the function arguments in the symbol map
     g_named_values.clear();
-    for (auto& arg : function->args())
-        g_named_values[std::string(arg.getName())] = &arg;
+    for (auto& arg : function->args()) {
+        AllocaInst* alloca = create_entry_block_alloca(function, arg.getName());
+        g_builder.CreateStore(&arg, alloca);
+        g_named_values[std::string(arg.getName())] = alloca;
+    }
 
     if (Value* retval = _body->codegen()) {
         g_builder.CreateRet(retval);
@@ -1013,6 +1178,8 @@ void initialize_module_and_passmanager() {
     // attach a pass manager
     g_fpm = std::make_unique<legacy::FunctionPassManager>(g_module.get());
 
+    // promote alloca to registers
+    g_fpm->add(createPromoteMemoryToRegisterPass());
     // simple peephole optimizations and bit-twiddling
     g_fpm->add(createInstructionCombiningPass());
     // reassociate expressions
@@ -1135,6 +1302,7 @@ int main() {
     InitializeNativeTargetAsmParser();
 
     // 1 is the lowest precedence
+    g_binop_precedence['='] = 2;
     g_binop_precedence['<'] = 10;
     g_binop_precedence['+'] = 20;
     g_binop_precedence['-'] = 20;
