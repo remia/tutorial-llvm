@@ -18,9 +18,11 @@ Compile to object file, then execute
 Ocaml
 -----
 
-brew install ocaml opam llvm
-# For IDE syntax highlight / autocomplete
-opam install merlin ocp-indent
-opam install ocamlbuild camlp5 llvm ctypes-foreign
+.. code-block::
 
-ocamlbuild -pkgs llvm,llvm.analysis toy.byte
+    brew install ocaml opam llvm
+    # For IDE syntax highlight / autocomplete
+    opam install merlin ocp-indent
+    opam install ocamlbuild camlp5 llvm ctypes-foreign
+
+    ocamlbuild -pkgs llvm,llvm.analysis toy.byte

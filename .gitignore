@@ -1,6 +1,8 @@
 .vscode
+*.dSYM
 _build
 node_modules
 a.out*
 *.byte
+*.o
 .DS_Store
