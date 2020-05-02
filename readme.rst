@@ -19,12 +19,25 @@ Emit LLVM IR to stderr
 
     ./toy -ir < fib.ks
 
+Emit LLVM IR to stderr without optimization
+
+.. code-block::
+
+    ./toy -dbgir < fib.ks
+
 Execute LLVM IR (result is the return code of second exec)
 
 .. code-block::
 
     ./toy -ir < fib.ks |& clang -x ir - -o fib
     ./fib
+
+Debug LLVM IR
+
+.. code-block::
+
+    ./toy -dbgir < fib.ks |& clang -x ir - -g -o fib
+    lldb fib
 
 Compile to object file, then execute from external program
 
