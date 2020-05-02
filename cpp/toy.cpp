@@ -43,6 +43,10 @@ using namespace llvm::orc;
 using namespace llvm::sys;
 
 
+static bool g_ir_mode = false;
+static bool g_obj_mode = false;
+
+
 //
 // Lexer
 //
@@ -377,6 +381,11 @@ std::unique_ptr<ExprAST> log_error(const char* str) {
 }
 
 std::unique_ptr<PrototypeAST> log_error_prototype(const char* str) {
+    log_error(str);
+    return nullptr;
+}
+
+std::unique_ptr<FunctionAST> log_error_function(const char* str) {
     log_error(str);
     return nullptr;
 }
@@ -765,9 +774,19 @@ std::unique_ptr<FunctionAST> parse_toplevelexpr() {
 
     // evaluate a top level expression into an anonymous function
     if (auto expr = parse_expression()) {
+        std::string name;
+
+        // in IR emiting mode, only allow for one 'main' top level expr
+        if (g_ir_mode and s_anon_count++ == 0)
+            name = "main";
+        else if (g_ir_mode and s_anon_count > 0)
+            return log_error_function("Only one top-level expr allowed");
+        else
+            name = "__anon_expr_" + std::to_string(s_anon_count++);
+
         // make an anonymous prototype
         auto prototype = std::make_unique<PrototypeAST>(
-            "__anon_expr_" + std::to_string(s_anon_count++),
+            name,
             std::vector<std::string>()
         );
 
@@ -1125,8 +1144,11 @@ Value* VarExprAST::codegen() {
 Function* PrototypeAST::codegen() {
     // function type: double(double, double) etc
     std::vector<Type*> doubles(_args.size(), Type::getDoubleTy(g_context));
+    // main function has a int32 returns type to provide c compatibility
+    auto ret_type = _name == "main" ?
+        Type::getInt32Ty(g_context) : Type::getDoubleTy(g_context);
     // last argument imply non var arg function
-    FunctionType* ft = FunctionType::get(Type::getDoubleTy(g_context), doubles, false);
+    FunctionType* ft = FunctionType::get(ret_type, doubles, false);
     Function* f = Function::Create(ft, Function::ExternalLinkage, _name, g_module.get());
 
     // set names for all arguments
@@ -1163,6 +1185,11 @@ Function* FunctionAST::codegen() {
     }
 
     if (Value* retval = _body->codegen()) {
+        // add a double to int32 conversion in place for the main
+        if (_name == "main")
+            retval = g_builder.CreateFPToUI(
+                retval, Type::getInt32Ty(g_context), "rettmp");
+
         g_builder.CreateRet(retval);
 
         // consistency checks
@@ -1180,6 +1207,36 @@ Function* FunctionAST::codegen() {
         g_binop_precedence.erase(prototype->getOperatorName());
 
     return nullptr;
+}
+
+//
+// Console print utilities
+//
+
+void print_prompt() {
+    if (g_ir_mode)
+        return;
+
+    fprintf(stderr, "ready> ");
+}
+
+template <typename IR>
+void print_ir(IR ir, const std::string& header) {
+    if (g_ir_mode)
+        return;
+
+    fprintf(stderr, "%s", header.c_str());
+    ir->print(errs());
+    fprintf(stderr, "\n");
+}
+
+typedef double (*FuncT)();
+
+void print_eval(FuncT& func) {
+    if (g_ir_mode)
+        return;
+
+    fprintf(stderr, "Evaluated to %f\n", func());
 }
 
 
@@ -1212,9 +1269,7 @@ void initialize_module_and_passmanager() {
 void handle_definition() {
     if (auto ast = parse_definition()) {
         if (auto ir = ast->codegen()) {
-            fprintf(stderr, "Parsed a function definition\n");
-            ir->print(errs());
-            fprintf(stderr, "\n");
+            print_ir(ir, "Parsed a function definition\n");
             g_jit->addModule(CloneModule(*g_module));
         }
     }
@@ -1226,9 +1281,7 @@ void handle_definition() {
 void handle_extern() {
     if (auto ast = parse_extern()) {
         if (auto ir = ast->codegen()) {
-            fprintf(stderr, "Parsed an extern\n");
-            ir->print(errs());
-            fprintf(stderr, "\n");
+            print_ir(ir, "Parsed an extern\n");
             g_function_prototypes[ast->getName()] = std::move(ast);
         }
     }
@@ -1241,9 +1294,7 @@ void handle_toplevel_expression() {
     if (auto ast = parse_toplevelexpr()) {
         if (auto ir = ast->codegen()) {
 
-            fprintf(stderr, "Parsed a top-level expression\n");
-            ir->print(errs());
-            fprintf(stderr, "\n");
+            print_ir(ir, "Parsed a top-level expression\n");
 
             // add current module to JIT
             auto module = g_jit->addModule(CloneModule(*g_module));
@@ -1253,9 +1304,8 @@ void handle_toplevel_expression() {
             assert(expr_symbol && "Function not found");
 
             // get symbol address and cast to the anonymous function type
-            typedef double (*FuncT)();
             FuncT func = (FuncT) (intptr_t) cantFail(expr_symbol.getAddress());
-            fprintf(stderr, "Evaluated to %f\n", func());
+            print_eval(func);
 
             // delete module from JIT
             g_jit->removeModule(module);
@@ -1287,7 +1337,7 @@ void main_loop() {
                 handle_toplevel_expression();
                 break;
         }
-        fprintf(stderr, "ready> ");
+        print_prompt();
     }
 }
 
@@ -1311,30 +1361,20 @@ extern "C" double printd(double x) {
 // Driver code
 //
 
-int main() {
-    InitializeAllTargetInfos();
-    InitializeAllTargets();
-    InitializeAllTargetMCs();
-    InitializeAllAsmParsers();
-    InitializeAllAsmPrinters();
+int emit_ir() {
+    // debug info version
+    g_module->addModuleFlag(
+        Module::Warning, "Debug Info Version", DEBUG_METADATA_VERSION);
+    // darwin supports only dwarf2
+    if (Triple(sys::getProcessTriple()).isOSDarwin())
+        g_module->addModuleFlag(
+            llvm::Module::Warning, "Dwarf Version", 2);
 
-    // 1 is the lowest precedence
-    g_binop_precedence['='] = 2;
-    g_binop_precedence['<'] = 10;
-    g_binop_precedence['+'] = 20;
-    g_binop_precedence['-'] = 20;
-    g_binop_precedence['*'] = 40;
-    g_binop_precedence['/'] = 40;
+    g_module->print(errs(), nullptr);
+    return 0;
+}
 
-    // repl loop
-    fprintf(stderr, "ready> ");
-    get_next_token();
-
-    g_jit = std::make_unique<KaleidoscopeJIT>();
-    initialize_module_and_passmanager();
-
-    main_loop();
-
+int emit_obj() {
     // setup compilation target architecture
     auto target_triple = sys::getDefaultTargetTriple();
     g_module->setTargetTriple(target_triple);
@@ -1378,6 +1418,44 @@ int main() {
     dest.flush();
 
     outs() << "Wrote " << filename << "\n";
+
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    // IR emiting mode
+    if (argc > 1 and strcmp(argv[1], "-ir") == 0)
+        g_ir_mode = true;
+    else if (argc > 1 and strcmp(argv[1], "-o") == 0)
+        g_obj_mode = true;
+
+    InitializeAllTargetInfos();
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmParsers();
+    InitializeAllAsmPrinters();
+
+    // 1 is the lowest precedence
+    g_binop_precedence['='] = 2;
+    g_binop_precedence['<'] = 10;
+    g_binop_precedence['+'] = 20;
+    g_binop_precedence['-'] = 20;
+    g_binop_precedence['*'] = 40;
+    g_binop_precedence['/'] = 40;
+
+    // repl loop
+    print_prompt();
+    get_next_token();
+
+    g_jit = std::make_unique<KaleidoscopeJIT>();
+    initialize_module_and_passmanager();
+
+    main_loop();
+
+    if (g_ir_mode)
+        return emit_ir();
+    else if (g_obj_mode)
+        return emit_obj();
 
     return 0;
 }

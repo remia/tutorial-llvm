@@ -1,18 +1,37 @@
 Cpp
 ---
 
+Compilation
+
+.. code-block::
+
+    clang++ -g -O3 toy.cpp -o toy `llvm-config --cxxflags --ldflags --libs --libfiles --system-libs` -std=c++14
+
 Access to the REPL
 
 .. code-block::
 
-    c++ -g -O3 toy.cpp -o toy `llvm-config --cxxflags --ldflags --libs --libfiles --system-libs` -std=c++14 && ./toy
+    ./toy
 
-Compile to object file, then execute
+Emit LLVM IR to stderr
 
 .. code-block::
 
-    c++ -g -O3 toy.cpp -o toy `llvm-config --cxxflags --ldflags --libs --libfiles --system-libs` -std=c++14 && ./toy < mandlebrot.txt
-    c++ main.cpp output.o -o main
+    ./toy -ir < fib.ks
+
+Execute LLVM IR (result is the return code of second exec)
+
+.. code-block::
+
+    ./toy -ir < fib.ks |& clang -x ir - -o fib
+    ./fib
+
+Compile to object file, then execute from external program
+
+.. code-block::
+
+    ./toy -o < mandlebrot.ks
+    clang++ main.cpp output.o -o main
     ./main
 
 Ocaml
