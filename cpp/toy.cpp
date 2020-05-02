@@ -1,5 +1,6 @@
 #include "KaleidoscopeJIT.h"
 #include <llvm/ADT/APFloat.h>
+#include <llvm/ADT/Optional.h>
 #include <llvm/ADT/STLExtras.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
@@ -12,12 +13,18 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Host.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/TargetRegistry.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Utils.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 
 #include <algorithm>
 #include <cassert>
@@ -33,6 +40,7 @@
 
 using namespace llvm;
 using namespace llvm::orc;
+using namespace llvm::sys;
 
 
 //
@@ -322,11 +330,14 @@ public:
         std::unique_ptr<PrototypeAST> prototype,
         std::unique_ptr<ExprAST> body
     )
-    : _prototype(std::move(prototype))
+    : _name(prototype->getName())
+    , _prototype(std::move(prototype))
     , _body(std::move(body))
     {}
     Function* codegen();
+    const std::string& getName() const { return _name; }
 private:
+    std::string _name;
     std::unique_ptr<PrototypeAST> _prototype;
     std::unique_ptr<ExprAST> _body;
 };
@@ -749,11 +760,15 @@ std::unique_ptr<FunctionAST> parse_definition() {
 // toplevelexpr
 //  ::= expression
 std::unique_ptr<FunctionAST> parse_toplevelexpr() {
+    // unique identifier for anonymous expr
+    static uint32_t s_anon_count = 0;
+
     // evaluate a top level expression into an anonymous function
     if (auto expr = parse_expression()) {
         // make an anonymous prototype
         auto prototype = std::make_unique<PrototypeAST>(
-            "__anon_expr", std::vector<std::string>()
+            "__anon_expr_" + std::to_string(s_anon_count++),
+            std::vector<std::string>()
         );
 
         return std::make_unique<FunctionAST>(
@@ -881,6 +896,8 @@ Value* BinaryExprAST::codegen() {
             return g_builder.CreateFSub(lhs, rhs, "subtmp");
         case '*':
             return g_builder.CreateFMul(lhs, rhs, "multmp");
+        case '/':
+            return g_builder.CreateFDiv(lhs, rhs, "divtmp");
         case '<':
             lhs = g_builder.CreateFCmpULT(lhs, rhs, "cmptmp");
             // convert bool 0 / 1 to double 0.0 / 1.0
@@ -1198,8 +1215,7 @@ void handle_definition() {
             fprintf(stderr, "Parsed a function definition\n");
             ir->print(errs());
             fprintf(stderr, "\n");
-            g_jit->addModule(std::move(g_module));
-            initialize_module_and_passmanager();
+            g_jit->addModule(CloneModule(*g_module));
         }
     }
     else
@@ -1230,11 +1246,10 @@ void handle_toplevel_expression() {
             fprintf(stderr, "\n");
 
             // add current module to JIT
-            auto module = g_jit->addModule(std::move(g_module));
-            initialize_module_and_passmanager();
+            auto module = g_jit->addModule(CloneModule(*g_module));
 
             // search for the anonymous function symbol
-            auto expr_symbol = g_jit->findSymbol("__anon_expr");
+            auto expr_symbol = g_jit->findSymbol(ast->getName());
             assert(expr_symbol && "Function not found");
 
             // get symbol address and cast to the anonymous function type
@@ -1297,9 +1312,11 @@ extern "C" double printd(double x) {
 //
 
 int main() {
-    InitializeNativeTarget();
-    InitializeNativeTargetAsmPrinter();
-    InitializeNativeTargetAsmParser();
+    InitializeAllTargetInfos();
+    InitializeAllTargets();
+    InitializeAllTargetMCs();
+    InitializeAllAsmParsers();
+    InitializeAllAsmPrinters();
 
     // 1 is the lowest precedence
     g_binop_precedence['='] = 2;
@@ -1307,7 +1324,9 @@ int main() {
     g_binop_precedence['+'] = 20;
     g_binop_precedence['-'] = 20;
     g_binop_precedence['*'] = 40;
+    g_binop_precedence['/'] = 40;
 
+    // repl loop
     fprintf(stderr, "ready> ");
     get_next_token();
 
@@ -1315,6 +1334,50 @@ int main() {
     initialize_module_and_passmanager();
 
     main_loop();
+
+    // setup compilation target architecture
+    auto target_triple = sys::getDefaultTargetTriple();
+    g_module->setTargetTriple(target_triple);
+
+    std::string error;
+    auto target = TargetRegistry::lookupTarget(target_triple, error);
+    if (!target) {
+        errs() << error;
+        return 1;
+    }
+
+    auto cpu = "generic";
+    auto features = "";
+
+    TargetOptions opt;
+    auto reloc = Optional<Reloc::Model>();
+    auto target_machine = target->createTargetMachine(
+        target_triple, cpu, features, opt, reloc);
+
+    g_module->setDataLayout(target_machine->createDataLayout());
+
+    // compilation
+    std::error_code ec;
+    auto filename = "output.o";
+    raw_fd_ostream dest(filename, ec, sys::fs::OF_None);
+
+    if (ec) {
+        errs() << "Could not open file: " << ec.message();
+        return 1;
+    }
+
+    legacy::PassManager pass;
+    auto file_type = CGFT_ObjectFile;
+
+    if (target_machine->addPassesToEmitFile(pass, dest, nullptr, file_type)) {
+        errs() << "Target machine can't emit a file of this type";
+        return 1;
+    }
+
+    pass.run(*g_module);
+    dest.flush();
+
+    outs() << "Wrote " << filename << "\n";
 
     return 0;
 }
